@@ -2,18 +2,22 @@
 Extractor SQL Server -> AWS S3
 Lee tablas de SQL Server y las sube directamente a S3 en formato TXT (CSV con ;)
 
-El periodo se detecta automaticamente desde la columna 'data' de la tabla AUDITS.
-Estructura S3: s3://bucket/CLIENTE/202601/TABLA.txt
+Periodos:
+  - Mensual: detectado desde MAX(data) de AUDITS     -> s3://bucket/CLIENTE/202601/TABLA.txt
+  - Semanal: detectado desde PERIODS_WEEKLY id_period=1 -> s3://bucket/CLIENTE/WEEKLY/20260302_20260308/TABLA.txt
 
 Uso:
-    # Periodo auto-detectado desde AUDITS.data
+    # Extraccion completa con periodos auto-detectados
     python extractor.py --client NOVO --database DB_NOVO
 
-    # Periodo manual (override)
+    # Periodo mensual manual (override)
     python extractor.py --client NOVO --database DB_NOVO --period 202601
 
     # Solo algunas tablas
     python extractor.py --client NOVO --database DB_NOVO --tables PERIODS.txt PRODUCTS.txt
+
+    # Con retencion automatica en S3
+    python extractor.py --client NOVO --database DB_NOVO --retention-monthly 3 --retention-weekly 6
 
     # Servidor con instancia
     python extractor.py --client NOVO --database DB_NOVO --server SERVIDOR\\INSTANCIA
@@ -43,6 +47,7 @@ from config import (
     ENCODING,
     EXTRACT_ORDER,
     S3_MULTIPART_THRESHOLD,
+    WEEKLY_TABLES,
     get_connection_string,
     get_sql_table_name,
 )
@@ -53,6 +58,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
 
 def setup_logging(client_name):
     log_format = "%(asctime)s [%(levelname)s] %(message)s"
@@ -73,6 +79,7 @@ def setup_logging(client_name):
 # S3
 # ---------------------------------------------------------------------------
 
+
 def get_s3_client():
     """Crea cliente S3 usando credenciales del .env"""
     return boto3.client(
@@ -89,7 +96,9 @@ def upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger):
     Usa multipart upload si el tamano supera S3_MULTIPART_THRESHOLD.
     """
     size_mb = len(data_bytes) / (1024 * 1024)
-    logger.info("  Subiendo a S3: s3://{}/{} ({:.1f} MB)".format(bucket, s3_key, size_mb))
+    logger.info(
+        "  Subiendo a S3: s3://{}/{} ({:.1f} MB)".format(bucket, s3_key, size_mb)
+    )
 
     try:
         if len(data_bytes) >= S3_MULTIPART_THRESHOLD:
@@ -101,7 +110,7 @@ def upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger):
             part_number = 1
 
             for offset in range(0, len(data_bytes), part_size):
-                chunk = data_bytes[offset:offset + part_size]
+                chunk = data_bytes[offset : offset + part_size]
                 response = s3_client.upload_part(
                     Bucket=bucket,
                     Key=s3_key,
@@ -110,9 +119,11 @@ def upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger):
                     Body=chunk,
                 )
                 parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                logger.info("  Parte {}: {:.1f} MB subida".format(
-                    part_number, len(chunk) / (1024 * 1024)
-                ))
+                logger.info(
+                    "  Parte {}: {:.1f} MB subida".format(
+                        part_number, len(chunk) / (1024 * 1024)
+                    )
+                )
                 part_number += 1
 
             s3_client.complete_multipart_upload(
@@ -136,6 +147,7 @@ def upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger):
 # Periodo desde AUDITS
 # ---------------------------------------------------------------------------
 
+
 def get_period_from_audits(conn, logger):
     """
     Lee el valor MAX(data) de la tabla L3_AUDITS_TB para usarlo como
@@ -149,7 +161,11 @@ def get_period_from_audits(conn, logger):
         cursor.execute("SELECT MAX(data) FROM {}".format(audits_table))
         row = cursor.fetchone()
         if not row or row[0] is None:
-            raise ValueError("La tabla {} esta vacia o la columna 'data' no tiene valores".format(audits_table))
+            raise ValueError(
+                "La tabla {} esta vacia o la columna 'data' no tiene valores".format(
+                    audits_table
+                )
+            )
         period = str(row[0])
         logger.info("Periodo detectado: {}".format(period))
         return period
@@ -158,8 +174,136 @@ def get_period_from_audits(conn, logger):
 
 
 # ---------------------------------------------------------------------------
+# Periodo semanal desde PERIODS_WEEKLY
+# ---------------------------------------------------------------------------
+
+
+def get_weekly_period_from_periods_weekly(conn, logger):
+    """
+    Lee week_start_date y week_end_date de L3_PERIODS_WEEKLY_TB donde id_period = 1.
+    Retorna string con formato YYYYMMDD_YYYYMMDD. Ej: 20260302_20260308
+    """
+    table = get_sql_table_name("PERIODS_WEEKLY.txt")
+    logger.info("Detectando periodo semanal desde {}...".format(table))
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT week_start_date, week_end_date FROM {} WHERE id_period = 1".format(
+                table
+            )
+        )
+        row = cursor.fetchone()
+        if not row or row[0] is None or row[1] is None:
+            raise ValueError(
+                "No se encontro fila con id_period = 1 en {}".format(table)
+            )
+        start = str(row[0]).replace("-", "")[:8]
+        end = str(row[1]).replace("-", "")[:8]
+        weekly_period = "{}_{}".format(start, end)
+        logger.info("Periodo semanal detectado: {}".format(weekly_period))
+        return weekly_period
+    finally:
+        cursor.close()
+
+
+# ---------------------------------------------------------------------------
+# Retencion S3
+# ---------------------------------------------------------------------------
+
+
+def list_s3_period_folders(s3_client, bucket, prefix, logger):
+    """
+    Lista las subcarpetas directas bajo un prefijo S3.
+    Retorna lista de strings ordenada ascendentemente.
+    """
+    paginator = s3_client.get_paginator("list_objects_v2")
+    folders = set()
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+        for cp in page.get("CommonPrefixes", []):
+            folder = cp["Prefix"][len(prefix) :].rstrip("/")
+            if folder:
+                folders.add(folder)
+    return sorted(folders)
+
+
+def delete_s3_folder(s3_client, bucket, prefix, logger):
+    """Borra todos los objetos bajo un prefijo S3."""
+    paginator = s3_client.get_paginator("list_objects_v2")
+    deleted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if objects:
+            s3_client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+            deleted += len(objects)
+    logger.info(
+        "  Eliminados {} objetos bajo s3://{}/{}".format(deleted, bucket, prefix)
+    )
+
+
+def apply_retention(
+    s3_client, bucket, client_name, retention_monthly, retention_weekly, logger
+):
+    """
+    Aplica politica de retencion eliminando periodos viejos de S3.
+    - retention_monthly: numero de periodos mensuales a conservar (0 = no borrar)
+    - retention_weekly: numero de periodos semanales a conservar (0 = no borrar)
+    """
+    if retention_monthly and retention_monthly > 0:
+        monthly_prefix = "{}/".format(client_name)
+        folders = [
+            f
+            for f in list_s3_period_folders(s3_client, bucket, monthly_prefix, logger)
+            if f != "WEEKLY"
+        ]
+        to_delete = (
+            folders[:-retention_monthly] if len(folders) > retention_monthly else []
+        )
+        if to_delete:
+            logger.info(
+                "Retencion mensual: eliminando {} periodo(s) antiguo(s)...".format(
+                    len(to_delete)
+                )
+            )
+            for folder in to_delete:
+                prefix = "{}/{}/".format(client_name, folder)
+                logger.info("  Borrando {}".format(prefix))
+                delete_s3_folder(s3_client, bucket, prefix, logger)
+        else:
+            logger.info(
+                "Retencion mensual: nada que eliminar ({} periodos en S3)".format(
+                    len(folders)
+                )
+            )
+
+    if retention_weekly and retention_weekly > 0:
+        weekly_prefix = "{}/WEEKLY/".format(client_name)
+        folders = list_s3_period_folders(s3_client, bucket, weekly_prefix, logger)
+        to_delete = (
+            folders[:-retention_weekly] if len(folders) > retention_weekly else []
+        )
+        if to_delete:
+            logger.info(
+                "Retencion semanal: eliminando {} periodo(s) antiguo(s)...".format(
+                    len(to_delete)
+                )
+            )
+            for folder in to_delete:
+                prefix = "{}/WEEKLY/{}/".format(client_name, folder)
+                logger.info("  Borrando {}".format(prefix))
+                delete_s3_folder(s3_client, bucket, prefix, logger)
+        else:
+            logger.info(
+                "Retencion semanal: nada que eliminar ({} periodos en S3)".format(
+                    len(folders)
+                )
+            )
+
+
+# ---------------------------------------------------------------------------
 # Extraccion
 # ---------------------------------------------------------------------------
+
 
 def extract_table(cursor, sql_table_name, logger):
     """
@@ -188,15 +332,18 @@ def extract_table(cursor, sql_table_name, logger):
             logger.info("  {} filas leidas...".format(total_rows))
 
     data_bytes = buffer.getvalue().encode(ENCODING, errors="replace")
-    logger.info("  {} filas extraidas ({:.1f} MB)".format(
-        total_rows, len(data_bytes) / (1024 * 1024)
-    ))
+    logger.info(
+        "  {} filas extraidas ({:.1f} MB)".format(
+            total_rows, len(data_bytes) / (1024 * 1024)
+        )
+    )
     return data_bytes, total_rows
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -229,6 +376,20 @@ def parse_args():
         default=None,
         help="Tablas especificas a extraer (opcional). Ej: PERIODS.txt PRODUCTS.txt",
     )
+    parser.add_argument(
+        "--retention-monthly",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Elimina periodos mensuales en S3 que excedan los ultimos N. Ej: 3",
+    )
+    parser.add_argument(
+        "--retention-weekly",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Elimina periodos semanales en S3 que excedan los ultimos N. Ej: 6",
+    )
     return parser.parse_args()
 
 
@@ -252,25 +413,36 @@ def main():
         logger.error("Error conectando a SQL Server: {}".format(e))
         sys.exit(1)
 
-    # Detectar periodo desde AUDITS si no se paso manualmente
+    # Detectar periodo mensual desde AUDITS si no se paso manualmente
     if args.period:
         period = args.period
-        logger.info("Periodo (manual): {}".format(period))
+        logger.info("Periodo mensual (manual): {}".format(period))
     else:
         try:
             period = get_period_from_audits(conn, logger)
         except Exception as e:
-            logger.error("No se pudo detectar el periodo: {}".format(e))
+            logger.error("No se pudo detectar el periodo mensual: {}".format(e))
             conn.close()
             sys.exit(1)
+
+    # Detectar periodo semanal desde PERIODS_WEEKLY
+    try:
+        weekly_period = get_weekly_period_from_periods_weekly(conn, logger)
+    except Exception as e:
+        logger.error("No se pudo detectar el periodo semanal: {}".format(e))
+        conn.close()
+        sys.exit(1)
 
     logger.info("=" * 70)
     logger.info("EXTRACTOR SQL SERVER -> S3")
     logger.info("=" * 70)
-    logger.info("Cliente  : {}".format(args.client))
-    logger.info("Base datos: {}".format(args.database))
-    logger.info("Servidor : {}".format(args.server))
-    logger.info("Periodo  : {}".format(period))
+    logger.info("Cliente         : {}".format(args.client))
+    logger.info("Base datos      : {}".format(args.database))
+    logger.info("Servidor        : {}".format(args.server))
+    logger.info("Periodo mensual : {}".format(period))
+    logger.info("Periodo semanal : {}".format(weekly_period))
+    logger.info("Retencion mens. : {}".format(args.retention_monthly or "sin limite"))
+    logger.info("Retencion sem.  : {}".format(args.retention_weekly or "sin limite"))
     logger.info("=" * 70)
 
     # Conectar a S3
@@ -286,9 +458,15 @@ def main():
 
     # Determinar tablas a extraer
     tables_to_extract = args.tables if args.tables else EXTRACT_ORDER
-    s3_prefix = "{}/{}/".format(args.client, period)
 
-    logger.info("\nPrefijo S3: s3://{}/{}".format(bucket, s3_prefix))
+    logger.info(
+        "\nPrefijo mensual : s3://{}/{}/{}/".format(bucket, args.client, period)
+    )
+    logger.info(
+        "Prefijo semanal : s3://{}/{}/WEEKLY/{}/".format(
+            bucket, args.client, weekly_period
+        )
+    )
     logger.info("Tablas a extraer: {}\n".format(len(tables_to_extract)))
 
     # Extraer y subir cada tabla
@@ -308,15 +486,20 @@ def main():
             data_bytes, total_rows = extract_table(cursor, sql_table, logger)
             cursor.close()
 
-            s3_key = "{}{}".format(s3_prefix, file_name)
+            if file_name in WEEKLY_TABLES:
+                s3_key = "{}/WEEKLY/{}/{}".format(args.client, weekly_period, file_name)
+            else:
+                s3_key = "{}/{}/{}".format(args.client, period, file_name)
             uploaded = upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger)
 
             duration = time.time() - start
 
             if uploaded:
-                logger.info("  OK {} -> {} filas en {:.1f}s".format(
-                    file_name, total_rows, duration
-                ))
+                logger.info(
+                    "  OK {} -> {} filas en {:.1f}s".format(
+                        file_name, total_rows, duration
+                    )
+                )
                 success_count += 1
             else:
                 error_count += 1
@@ -328,16 +511,37 @@ def main():
     conn.close()
 
     total_duration = time.time() - total_start
+
+    # Aplicar retencion si se solicitó (despues de subir todo)
+    if args.retention_monthly or args.retention_weekly:
+        logger.info("\n" + "=" * 70)
+        logger.info("RETENCION S3")
+        logger.info("=" * 70)
+        apply_retention(
+            s3_client,
+            bucket,
+            args.client,
+            args.retention_monthly,
+            args.retention_weekly,
+            logger,
+        )
+
     logger.info("\n" + "=" * 70)
     logger.info("RESUMEN")
     logger.info("=" * 70)
-    logger.info("Exitosas : {}".format(success_count))
-    logger.info("Errores  : {}".format(error_count))
-    logger.info("Duracion : {:.1f}s ({:.1f} min)".format(
-        total_duration, total_duration / 60
-    ))
-    logger.info("S3 prefix: s3://{}/{}".format(bucket, s3_prefix))
-    logger.info("Periodo  : {}".format(period))
+    logger.info("Exitosas        : {}".format(success_count))
+    logger.info("Errores         : {}".format(error_count))
+    logger.info(
+        "Duracion        : {:.1f}s ({:.1f} min)".format(
+            total_duration, total_duration / 60
+        )
+    )
+    logger.info("Periodo mensual : s3://{}/{}/{}/".format(bucket, args.client, period))
+    logger.info(
+        "Periodo semanal : s3://{}/{}/WEEKLY/{}/".format(
+            bucket, args.client, weekly_period
+        )
+    )
     logger.info("=" * 70)
 
     if error_count > 0:

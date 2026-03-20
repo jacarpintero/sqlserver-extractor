@@ -34,6 +34,14 @@ TABLE_MAPPING = {
     "PH360_WEEKLY.txt":         "PH360_WEEKLY_DETAIL_REPORT",
 }
 
+# Tablas con frecuencia semanal (van a CLIENTE/WEEKLY/PERIODO_SEMANAL/)
+WEEKLY_TABLES = {
+    "PERIODS_WEEKLY.txt",
+    "OUTLETS_WEEKLY.txt",
+    "DDD_WEEKLY.txt",
+    "PH360_WEEKLY.txt",
+}
+
 # Orden de extraccion (respeta dependencias para consistencia)
 EXTRACT_ORDER = [
     "PERIODS.txt",

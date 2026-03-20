@@ -1,0 +1,17 @@
+# =============================================================================
+# Windows — Extractor SQL Server -> S3
+# Compatible con Python 3.6.3+
+# Instalar con: pip install -r requirements-windows.txt
+# =============================================================================
+
+# SQL Server
+pyodbc>=4.0.30
+
+# AWS S3 (boto3 1.24+ requiere Python 3.7+)
+boto3>=1.20.0,<1.24.0
+
+# Utilidades (python-dotenv 1.0+ requiere Python 3.8+)
+python-dotenv>=0.19.0,<1.0.0
+
+# HTTP para notificar EC2 (requests 2.28+ requiere Python 3.7+)
+requests>=2.20.0,<2.28.0
