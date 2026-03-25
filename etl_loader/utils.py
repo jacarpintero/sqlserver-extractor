@@ -20,8 +20,15 @@ def setup_logging() -> logging.Logger:
     if logger.handlers:
         return logger
 
-    # Handler para archivo
-    file_handler = logging.FileHandler(LOG_CONFIG['log_file'])
+    # Archivo: ETL_LOG_FILE (ej. /app/logs/etl_load.log en Docker con volumen montado)
+    # o, si no existe, LOG_CONFIG relativo a esta carpeta etl_loader/
+    log_path = os.environ.get("ETL_LOG_FILE", "").strip() or LOG_CONFIG["log_file"]
+    if not os.path.isabs(log_path):
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), log_path)
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    file_handler = logging.FileHandler(log_path)
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -36,6 +43,8 @@ def setup_logging() -> logging.Logger:
         console_formatter = logging.Formatter('%(message)s')
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
+
+    logger.info("Archivo de log ETL: {}".format(log_path))
 
     return logger
 

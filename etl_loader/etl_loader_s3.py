@@ -7,9 +7,11 @@ Estructura S3 esperada:
   Semanal : s3://bucket/CLIENTE/WEEKLY/20260302_20260308/TABLA.txt
 """
 
+import csv
 import os
 import time
-from typing import Optional
+from io import StringIO
+from typing import List, Optional, Sequence
 
 import psycopg2
 
@@ -19,6 +21,7 @@ from etl_loader.config import (
     LOAD_ORDER,
     FOREIGN_KEY_VALIDATIONS,
     OPTIMIZATION_CONFIG,
+    COPY_INTEGER_DECIMAL_FIX,
 )
 from etl_loader.utils import (
     setup_logging,
@@ -39,6 +42,35 @@ WEEKLY_TABLES = {
     "DDD_WEEKLY.txt",
     "PH360_WEEKLY.txt",
 }
+
+
+def _parse_csv_header_row(first_line: str, delimiter: str) -> List[str]:
+    """Primera fila del archivo como nombres de columna (respeta comillas CSV, quita BOM)."""
+    first_line = first_line.lstrip("\ufeff")
+    row = next(csv.reader(StringIO(first_line.strip()), delimiter=delimiter))
+    return [c.strip() for c in row]
+
+
+def _indices_for_integer_decimal_fix(columns: Sequence[str], names: Sequence[str]) -> List[int]:
+    """Índices de columnas a normalizar (123.0 -> 123); nombres sin distinguir mayúsculas."""
+    lower_to_idx = {c.strip().lower(): i for i, c in enumerate(columns)}
+    out: List[int] = []
+    for name in names:
+        idx = lower_to_idx.get(name.strip().lower())
+        if idx is not None and idx not in out:
+            out.append(idx)
+    return out
+
+
+def _merge_unique_indices(*groups: Sequence[int]) -> List[int]:
+    seen = set()
+    merged: List[int] = []
+    for group in groups:
+        for i in group:
+            if i not in seen:
+                seen.add(i)
+                merged.append(i)
+    return merged
 
 
 class ETLLoaderS3:
@@ -172,22 +204,25 @@ class ETLLoaderS3:
             self.logger.info("Cargando datos en {}...".format(table_name))
 
             with self._open_file(file_path_or_key) as f:
-                header_line = f.readline().strip()
-                columns = header_line.split(delimiter)
+                header_line = f.readline()
+                if not header_line:
+                    self.logger.error("Archivo vacio: {}".format(file_path_or_key))
+                    return False, 0, time.time() - start_time
+                columns = _parse_csv_header_row(header_line, delimiter)
                 columns_str = ", ".join(columns)
 
-            needs_decimal_fix = False
-            integer_indices = []
-
+            detail_idx: List[int] = []
             if table_name.endswith("_detail_reports"):
-                integer_columns = ["units", "data"]
-                for col in integer_columns:
-                    if col in columns:
-                        integer_indices.append(columns.index(col))
-                if integer_indices:
-                    needs_decimal_fix = True
-                    col_names = [columns[idx] for idx in integer_indices]
-                    self.logger.info("Columnas INTEGER a convertir: {}".format(col_names))
+                detail_idx = _indices_for_integer_decimal_fix(columns, ("units", "data"))
+            table_idx = _indices_for_integer_decimal_fix(
+                columns, COPY_INTEGER_DECIMAL_FIX.get(table_name, ())
+            )
+            integer_indices = _merge_unique_indices(detail_idx, table_idx)
+
+            needs_decimal_fix = bool(integer_indices)
+            if integer_indices:
+                col_names = [columns[idx] for idx in integer_indices]
+                self.logger.info("Columnas INTEGER a convertir: {}".format(col_names))
 
             use_freeze = OPTIMIZATION_CONFIG["use_freeze"] and truncate_mode != "skip"
             freeze_option = "FREEZE true," if use_freeze else ""
@@ -216,20 +251,40 @@ class ETLLoaderS3:
 
                 def convert_line_generator():
                     with self._open_file(file_path_or_key) as f_in:
-                        yield f_in.readline()
+                        header_raw = f_in.readline()
+                        if not header_raw.endswith("\n"):
+                            header_raw += "\n"
+                        yield header_raw
                         line_count = 0
                         for line in f_in:
                             line_count += 1
-                            parts = line.strip().split(delimiter)
+                            if not line.strip():
+                                yield line if line.endswith("\n") else line + "\n"
+                                continue
+                            row_text = line.rstrip("\r\n")
+                            try:
+                                parts = next(csv.reader(StringIO(row_text), delimiter=delimiter))
+                            except StopIteration:
+                                yield line if line.endswith("\n") else line + "\n"
+                                continue
                             for idx in integer_indices:
                                 if len(parts) > idx and parts[idx]:
+                                    raw = parts[idx].strip()
                                     try:
-                                        float_val = float(parts[idx])
+                                        float_val = float(raw)
                                         if float_val == int(float_val):
                                             parts[idx] = str(int(float_val))
-                                    except (ValueError, IndexError):
+                                    except (ValueError, OverflowError):
                                         pass
-                            yield delimiter.join(parts) + "\n"
+                            out = StringIO()
+                            w = csv.writer(
+                                out,
+                                delimiter=delimiter,
+                                quoting=csv.QUOTE_MINIMAL,
+                                lineterminator="\n",
+                            )
+                            w.writerow(parts)
+                            yield out.getvalue()
                             if line_count % 100000 == 0:
                                 self.logger.info("Procesando linea {:,}...".format(line_count))
 

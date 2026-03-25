@@ -247,6 +247,17 @@ FOREIGN_KEY_VALIDATIONS = {
     ],
 }
 
+# Columnas que a veces vienen como "123.0" en el CSV (export numérico) y deben
+# normalizarse a entero para COPY hacia columnas INTEGER/BIGINT en PostgreSQL.
+COPY_INTEGER_DECIMAL_FIX = {
+    "market_pack_audit": [
+        "id",
+        "pack_id",
+        "market_line_market_id",
+        "audit_id",
+    ],
+}
+
 # Configuración de optimización
 OPTIMIZATION_CONFIG = {
     "use_freeze": True,  # Usa FREEZE en COPY para mejor performance
@@ -257,7 +268,7 @@ OPTIMIZATION_CONFIG = {
     "truncate_mode": "safe",  # "safe" (sin CASCADE), "cascade", "delete", "skip"
 }
 
-# Configuración de logging
+# Configuración de logging (log_file relativo a la carpeta etl_loader/)
 LOG_CONFIG = {
     "log_file": "etl_load.log",
     "log_level": "INFO",

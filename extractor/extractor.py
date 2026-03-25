@@ -181,7 +181,7 @@ def get_period_from_audits(conn, logger):
 def get_weekly_period_from_periods_weekly(conn, logger):
     """
     Lee week_start_date y week_end_date de L3_PERIODS_WEEKLY_TB donde id_period = 1.
-    Retorna string con formato YYYYMMDD_YYYYMMDD. Ej: 20260302_20260308
+    Retorna string con formato YYYYMMDD_YYYYMMDD o None si la tabla no existe.
     """
     table = get_sql_table_name("PERIODS_WEEKLY.txt")
     logger.info("Detectando periodo semanal desde {}...".format(table))
@@ -195,14 +195,16 @@ def get_weekly_period_from_periods_weekly(conn, logger):
         )
         row = cursor.fetchone()
         if not row or row[0] is None or row[1] is None:
-            raise ValueError(
-                "No se encontro fila con id_period = 1 en {}".format(table)
-            )
+            logger.warning("No se encontro fila con id_period = 1 en {}".format(table))
+            return None
         start = str(row[0]).replace("-", "")[:8]
         end = str(row[1]).replace("-", "")[:8]
         weekly_period = "{}_{}".format(start, end)
         logger.info("Periodo semanal detectado: {}".format(weekly_period))
         return weekly_period
+    except Exception as e:
+        logger.warning("Tabla semanal no disponible ({}): {}".format(table, e))
+        return None
     finally:
         cursor.close()
 
@@ -303,6 +305,27 @@ def apply_retention(
 # ---------------------------------------------------------------------------
 # Extraccion
 # ---------------------------------------------------------------------------
+
+
+def check_table(conn, sql_table_name, logger):
+    """
+    Verifica si una tabla existe en SQL Server y tiene filas.
+    Retorna: ('ok', count), ('not_found', 0) o ('empty', 0)
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) FROM {}".format(sql_table_name))
+        count = cursor.fetchone()[0]
+        if count == 0:
+            return "empty", 0
+        return "ok", count
+    except Exception as e:
+        error_str = str(e)
+        if "42S02" in error_str or "Invalid object name" in error_str:
+            return "not_found", 0
+        raise
+    finally:
+        cursor.close()
 
 
 def extract_table(cursor, sql_table_name, logger):
@@ -425,13 +448,10 @@ def main():
             conn.close()
             sys.exit(1)
 
-    # Detectar periodo semanal desde PERIODS_WEEKLY
-    try:
-        weekly_period = get_weekly_period_from_periods_weekly(conn, logger)
-    except Exception as e:
-        logger.error("No se pudo detectar el periodo semanal: {}".format(e))
-        conn.close()
-        sys.exit(1)
+    # Detectar periodo semanal desde PERIODS_WEEKLY (None si el cliente no tiene weekly)
+    weekly_period = get_weekly_period_from_periods_weekly(conn, logger)
+    if weekly_period is None:
+        logger.warning("Cliente sin datos semanales. Las tablas WEEKLY seran omitidas.")
 
     logger.info("=" * 70)
     logger.info("EXTRACTOR SQL SERVER -> S3")
@@ -440,7 +460,7 @@ def main():
     logger.info("Base datos      : {}".format(args.database))
     logger.info("Servidor        : {}".format(args.server))
     logger.info("Periodo mensual : {}".format(period))
-    logger.info("Periodo semanal : {}".format(weekly_period))
+    logger.info("Periodo semanal : {}".format(weekly_period or "N/A (sin datos semanales)"))
     logger.info("Retencion mens. : {}".format(args.retention_monthly or "sin limite"))
     logger.info("Retencion sem.  : {}".format(args.retention_weekly or "sin limite"))
     logger.info("=" * 70)
@@ -462,11 +482,12 @@ def main():
     logger.info(
         "\nPrefijo mensual : s3://{}/{}/{}/".format(bucket, args.client, period)
     )
-    logger.info(
-        "Prefijo semanal : s3://{}/{}/WEEKLY/{}/".format(
-            bucket, args.client, weekly_period
+    if weekly_period:
+        logger.info(
+            "Prefijo semanal : s3://{}/{}/WEEKLY/{}/".format(
+                bucket, args.client, weekly_period
+            )
         )
-    )
     logger.info("Tablas a extraer: {}\n".format(len(tables_to_extract)))
 
     # Extraer y subir cada tabla
@@ -474,12 +495,32 @@ def main():
     error_count = 0
     total_start = time.time()
 
+    skipped_count = 0
+
     for file_name in tables_to_extract:
         logger.info("-" * 70)
         logger.info("Procesando: {}".format(file_name))
 
+        # Omitir tablas weekly si el cliente no tiene datos semanales
+        if file_name in WEEKLY_TABLES and weekly_period is None:
+            logger.warning("  OMITIDA (cliente sin datos semanales): {}".format(file_name))
+            skipped_count += 1
+            continue
+
         try:
             sql_table = get_sql_table_name(file_name)
+
+            # Verificar existencia y filas antes de extraer
+            status, row_count = check_table(conn, sql_table, logger)
+            if status == "not_found":
+                logger.warning("  OMITIDA (tabla no existe en SQL Server): {}".format(sql_table))
+                skipped_count += 1
+                continue
+            if status == "empty":
+                logger.warning("  OMITIDA (tabla vacia): {}".format(sql_table))
+                skipped_count += 1
+                continue
+
             cursor = conn.cursor()
             start = time.time()
 
@@ -530,6 +571,7 @@ def main():
     logger.info("RESUMEN")
     logger.info("=" * 70)
     logger.info("Exitosas        : {}".format(success_count))
+    logger.info("Omitidas        : {}".format(skipped_count))
     logger.info("Errores         : {}".format(error_count))
     logger.info(
         "Duracion        : {:.1f}s ({:.1f} min)".format(
@@ -537,11 +579,12 @@ def main():
         )
     )
     logger.info("Periodo mensual : s3://{}/{}/{}/".format(bucket, args.client, period))
-    logger.info(
-        "Periodo semanal : s3://{}/{}/WEEKLY/{}/".format(
-            bucket, args.client, weekly_period
+    if weekly_period:
+        logger.info(
+            "Periodo semanal : s3://{}/{}/WEEKLY/{}/".format(
+                bucket, args.client, weekly_period
+            )
         )
-    )
     logger.info("=" * 70)
 
     if error_count > 0:

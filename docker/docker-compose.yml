@@ -13,6 +13,8 @@ services:
       - ../.env
     environment:
       - PYTHONUNBUFFERED=1
+      # Volumen ../logs -> /app/logs: el ETL escribe aquí para verlo en el host
+      - ETL_LOG_FILE=/app/logs/etl_load.log
     volumes:
       - ../logs:/app/logs
     healthcheck:

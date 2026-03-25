@@ -90,6 +90,18 @@ def run_pipeline_background(job_id: str, request: TriggerRequest):
         else:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["message"] = result.stderr[-500:] if result.stderr else "Error desconocido"
+            if result.stderr:
+                logger.error(
+                    "Job {} pipeline stderr (ultimos 8k):\n{}".format(
+                        job_id, result.stderr[-8000:]
+                    )
+                )
+            if result.stdout:
+                logger.error(
+                    "Job {} pipeline stdout (ultimos 8k):\n{}".format(
+                        job_id, result.stdout[-8000:]
+                    )
+                )
     except Exception as e:
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["message"] = str(e)
