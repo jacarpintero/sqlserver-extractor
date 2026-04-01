@@ -115,6 +115,11 @@ class ETLLoaderS3:
         self.logger.info("=" * 80)
         self.logger.info("Validar FK : {}".format(validate_fk))
         self.logger.info("Modo dry-run: {}".format(dry_run))
+        db_name = DB_CONFIG.get("database") or "(no configurada)"
+        db_host = DB_CONFIG.get("host") or "(no configurado)"
+        self.logger.info(
+            "Destino ETL — PostgreSQL: base de datos '{}' en host '{}'".format(db_name, db_host)
+        )
 
     def _get_connection_options(self) -> str:
         if OPTIMIZATION_CONFIG["synchronous_commit"]:
@@ -180,6 +185,17 @@ class ETLLoaderS3:
             options = self._get_connection_options()
             conn = psycopg2.connect(**DB_CONFIG, options=options) if options else get_db_connection()
             cur = conn.cursor()
+
+            # Verificar que la tabla existe en la BD antes de intentar cargar
+            cur.execute("""
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            """, (table_name,))
+            if cur.fetchone() is None:
+                self.logger.warning(
+                    "Tabla '{}' no existe en la BD, omitiendo...".format(table_name)
+                )
+                return True, 0, 0.0
 
             if OPTIMIZATION_CONFIG["disable_triggers"]:
                 self.logger.info("Desactivando triggers en {}".format(table_name))
@@ -367,6 +383,14 @@ class ETLLoaderS3:
             if "conn" in locals():
                 conn.close()
 
+    def _get_existing_tables(self, cur) -> set:
+        """Retorna el conjunto de tablas que realmente existen en PostgreSQL."""
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        """)
+        return {row[0] for row in cur.fetchall()}
+
     def truncate_all_tables(self) -> bool:
         self.logger.info("\n" + "=" * 80)
         self.logger.info("TRUNCANDO TODAS LAS TABLAS (orden inverso)")
@@ -376,28 +400,38 @@ class ETLLoaderS3:
             conn = get_db_connection()
             cur = conn.cursor()
 
+            existing = self._get_existing_tables(cur)
+
+            # Filtrar solo las tablas que existen en la BD
+            tables_to_truncate = []
+            for file_name in LOAD_ORDER:
+                if file_name in TABLE_MAPPING:
+                    table_name = TABLE_MAPPING[file_name]["table"]
+                    if table_name in existing:
+                        tables_to_truncate.append(table_name)
+                    else:
+                        self.logger.warning(
+                            "Tabla '{}' no existe en la BD, omitiendo...".format(table_name)
+                        )
+
+            if not tables_to_truncate:
+                self.logger.warning("No hay tablas para truncar.")
+                return True
+
             if OPTIMIZATION_CONFIG["disable_triggers"]:
                 self.logger.info("Desactivando triggers en todas las tablas...")
-                for file_name in LOAD_ORDER:
-                    if file_name in TABLE_MAPPING:
-                        table_name = TABLE_MAPPING[file_name]["table"]
-                        cur.execute("ALTER TABLE {} DISABLE TRIGGER ALL;".format(table_name))
+                for table_name in tables_to_truncate:
+                    cur.execute("ALTER TABLE {} DISABLE TRIGGER ALL;".format(table_name))
 
-            table_list = [
-                "public.{}".format(TABLE_MAPPING[f]["table"])
-                for f in LOAD_ORDER
-                if f in TABLE_MAPPING
-            ]
-            self.logger.info("Truncando {} tablas...".format(len(table_list)))
+            self.logger.info("Truncando {} tablas...".format(len(tables_to_truncate)))
+            table_list = ["public.{}".format(t) for t in tables_to_truncate]
             cur.execute("TRUNCATE TABLE {} RESTART IDENTITY CASCADE;".format(", ".join(table_list)))
             conn.commit()
 
             if OPTIMIZATION_CONFIG["disable_triggers"]:
                 self.logger.info("Reactivando triggers...")
-                for file_name in LOAD_ORDER:
-                    if file_name in TABLE_MAPPING:
-                        table_name = TABLE_MAPPING[file_name]["table"]
-                        cur.execute("ALTER TABLE {} ENABLE TRIGGER ALL;".format(table_name))
+                for table_name in tables_to_truncate:
+                    cur.execute("ALTER TABLE {} ENABLE TRIGGER ALL;".format(table_name))
                 conn.commit()
 
             self.logger.info("OK Todas las tablas truncadas\n")

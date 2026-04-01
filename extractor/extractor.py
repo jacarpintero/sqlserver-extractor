@@ -41,7 +41,7 @@ import pyodbc
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
-from config import (
+from extractor.config import (
     BATCH_SIZE,
     DELIMITER,
     ENCODING,
