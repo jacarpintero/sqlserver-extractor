@@ -29,10 +29,10 @@ from __future__ import print_function
 
 import argparse
 import csv
-import io
 import logging
 import os
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -46,7 +46,6 @@ from extractor.config import (
     DELIMITER,
     ENCODING,
     EXTRACT_ORDER,
-    S3_MULTIPART_THRESHOLD,
     WEEKLY_TABLES,
     get_connection_string,
     get_sql_table_name,
@@ -90,51 +89,19 @@ def get_s3_client():
     )
 
 
-def upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger):
+def upload_to_s3(s3_client, bucket, s3_key, local_path, logger):
     """
-    Sube bytes a S3.
-    Usa multipart upload si el tamano supera S3_MULTIPART_THRESHOLD.
+    Sube un archivo local a S3.
+    boto3 usa multipart automaticamente para archivos grandes.
     """
-    size_mb = len(data_bytes) / (1024 * 1024)
+    size_bytes = os.path.getsize(local_path)
+    size_mb = size_bytes / (1024 * 1024)
     logger.info(
         "  Subiendo a S3: s3://{}/{} ({:.1f} MB)".format(bucket, s3_key, size_mb)
     )
 
     try:
-        if len(data_bytes) >= S3_MULTIPART_THRESHOLD:
-            # Multipart upload para archivos grandes
-            mpu = s3_client.create_multipart_upload(Bucket=bucket, Key=s3_key)
-            upload_id = mpu["UploadId"]
-            parts = []
-            part_size = 8 * 1024 * 1024  # 8 MB por parte
-            part_number = 1
-
-            for offset in range(0, len(data_bytes), part_size):
-                chunk = data_bytes[offset : offset + part_size]
-                response = s3_client.upload_part(
-                    Bucket=bucket,
-                    Key=s3_key,
-                    PartNumber=part_number,
-                    UploadId=upload_id,
-                    Body=chunk,
-                )
-                parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                logger.info(
-                    "  Parte {}: {:.1f} MB subida".format(
-                        part_number, len(chunk) / (1024 * 1024)
-                    )
-                )
-                part_number += 1
-
-            s3_client.complete_multipart_upload(
-                Bucket=bucket,
-                Key=s3_key,
-                UploadId=upload_id,
-                MultipartUpload={"Parts": parts},
-            )
-        else:
-            s3_client.put_object(Bucket=bucket, Key=s3_key, Body=data_bytes)
-
+        s3_client.upload_file(local_path, bucket, s3_key)
         logger.info("  OK subido exitosamente")
         return True
 
@@ -330,37 +297,46 @@ def check_table(conn, sql_table_name, logger):
 
 def extract_table(cursor, sql_table_name, logger):
     """
-    Extrae una tabla de SQL Server y retorna los bytes del TXT.
-    Procesa en batches para no cargar todo en memoria de una vez.
+    Extrae una tabla de SQL Server a un archivo temporal (TXT CSV con ;).
+    Escribe por batches: el resultado no se acumula entero en RAM (solo batches
+    de fetchmany + buffer de escritura del SO).
     """
     logger.info("  Ejecutando SELECT * FROM {}...".format(sql_table_name))
 
     cursor.execute("SELECT * FROM {}".format(sql_table_name))
 
-    buffer = io.StringIO()
-    writer = csv.writer(buffer, delimiter=DELIMITER, lineterminator="\n")
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="sql_extract_")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding=ENCODING, errors="replace", newline="") as out:
+            writer = csv.writer(out, delimiter=DELIMITER, lineterminator="\n")
 
-    # Header
-    columns = [col[0] for col in cursor.description]
-    writer.writerow(columns)
+            columns = [col[0] for col in cursor.description]
+            writer.writerow(columns)
 
-    total_rows = 0
-    while True:
-        rows = cursor.fetchmany(BATCH_SIZE)
-        if not rows:
-            break
-        writer.writerows(rows)
-        total_rows += len(rows)
-        if total_rows % 100000 == 0:
-            logger.info("  {} filas leidas...".format(total_rows))
+            total_rows = 0
+            while True:
+                rows = cursor.fetchmany(BATCH_SIZE)
+                if not rows:
+                    break
+                writer.writerows(rows)
+                total_rows += len(rows)
+                if total_rows % 100000 == 0:
+                    logger.info("  {} filas leidas...".format(total_rows))
 
-    data_bytes = buffer.getvalue().encode(ENCODING, errors="replace")
-    logger.info(
-        "  {} filas extraidas ({:.1f} MB)".format(
-            total_rows, len(data_bytes) / (1024 * 1024)
+        size_bytes = os.path.getsize(path)
+        logger.info(
+            "  {} filas extraidas ({:.1f} MB)".format(
+                total_rows, size_bytes / (1024 * 1024)
+            )
         )
-    )
-    return data_bytes, total_rows
+        return path, total_rows
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +483,7 @@ def main():
             skipped_count += 1
             continue
 
+        tmp_path = None
         try:
             sql_table = get_sql_table_name(file_name)
 
@@ -524,14 +501,14 @@ def main():
             cursor = conn.cursor()
             start = time.time()
 
-            data_bytes, total_rows = extract_table(cursor, sql_table, logger)
+            tmp_path, total_rows = extract_table(cursor, sql_table, logger)
             cursor.close()
 
             if file_name in WEEKLY_TABLES:
                 s3_key = "{}/WEEKLY/{}/{}".format(args.client, weekly_period, file_name)
             else:
                 s3_key = "{}/{}/{}".format(args.client, period, file_name)
-            uploaded = upload_to_s3(s3_client, bucket, s3_key, data_bytes, logger)
+            uploaded = upload_to_s3(s3_client, bucket, s3_key, tmp_path, logger)
 
             duration = time.time() - start
 
@@ -546,8 +523,20 @@ def main():
                 error_count += 1
 
         except Exception as e:
-            logger.error("  ERROR procesando {}: {}".format(file_name, e))
+            err_text = str(e).strip() or repr(e)
+            logger.error(
+                "  ERROR procesando {}: {} ({})".format(
+                    file_name, type(e).__name__, err_text
+                ),
+                exc_info=True,
+            )
             error_count += 1
+        finally:
+            if tmp_path and os.path.isfile(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     conn.close()
 

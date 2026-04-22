@@ -75,9 +75,6 @@ ENCODING = "latin1"
 # Tamano del batch al leer filas de SQL Server
 BATCH_SIZE = 50000
 
-# Tamano minimo en bytes para usar multipart upload en S3 (5MB)
-S3_MULTIPART_THRESHOLD = 5 * 1024 * 1024
-
 
 def get_sql_table_name(table_key):
     """Retorna el nombre completo de la tabla en SQL Server"""
