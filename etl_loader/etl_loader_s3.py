@@ -152,6 +152,13 @@ class ETLLoaderS3:
         else:
             return self.s3_manager.count_file_lines(file_path_or_key)
 
+    def _read_header_line(self, file_path_or_key: str, encoding: str = "latin1") -> str:
+        """Lee solo la primera línea del archivo de forma eficiente (range request en S3)."""
+        if self.mode == "LOCAL":
+            with open(file_path_or_key, "r", encoding=encoding, errors="replace") as f:
+                return f.readline()
+        return self.s3_manager.get_file_header_line(file_path_or_key, encoding)
+
     def _open_file(self, file_path_or_key: str, encoding: str = "latin1"):
         if self.mode == "LOCAL":
             return open(file_path_or_key, "r", encoding=encoding, errors="replace")
@@ -219,13 +226,12 @@ class ETLLoaderS3:
 
             self.logger.info("Cargando datos en {}...".format(table_name))
 
-            with self._open_file(file_path_or_key) as f:
-                header_line = f.readline()
-                if not header_line:
-                    self.logger.error("Archivo vacio: {}".format(file_path_or_key))
-                    return False, 0, time.time() - start_time
-                columns = _parse_csv_header_row(header_line, delimiter)
-                columns_str = ", ".join(columns)
+            header_line = self._read_header_line(file_path_or_key)
+            if not header_line:
+                self.logger.error("Archivo vacio: {}".format(file_path_or_key))
+                return False, 0, time.time() - start_time
+            columns = _parse_csv_header_row(header_line, delimiter)
+            columns_str = ", ".join(columns)
 
             detail_idx: List[int] = []
             if table_name.endswith("_detail_reports"):
@@ -267,9 +273,8 @@ class ETLLoaderS3:
 
                 def convert_line_generator():
                     with self._open_file(file_path_or_key) as f_in:
-                        header_raw = f_in.readline()
-                        if not header_raw.endswith("\n"):
-                            header_raw += "\n"
+                        f_in.readline()  # avanzar pasado el header (ya leído vía range request)
+                        header_raw = header_line if header_line.endswith("\n") else header_line + "\n"
                         yield header_raw
                         line_count = 0
                         for line in f_in:
@@ -307,32 +312,38 @@ class ETLLoaderS3:
                 class GeneratorFile:
                     def __init__(self, generator):
                         self.generator = generator
-                        self.buffer = ""
+                        self._parts = []  # lista de strings; join es O(n) vs O(n²) de concatenar
 
                     def read(self, size=-1):
-                        while len(self.buffer) < size or size == -1:
+                        if size == -1:
+                            for chunk in self.generator:
+                                self._parts.append(chunk)
+                            result = "".join(self._parts)
+                            self._parts = []
+                            return result
+                        while sum(len(p) for p in self._parts) < size:
                             try:
-                                self.buffer += next(self.generator)
-                                if size == -1:
-                                    continue
+                                self._parts.append(next(self.generator))
                             except StopIteration:
                                 break
-                        if size == -1:
-                            result, self.buffer = self.buffer, ""
-                        else:
-                            result, self.buffer = self.buffer[:size], self.buffer[size:]
+                        combined = "".join(self._parts)
+                        result, remainder = combined[:size], combined[size:]
+                        self._parts = [remainder] if remainder else []
                         return result
 
                     def readline(self):
-                        while "\n" not in self.buffer:
+                        while True:
+                            combined = "".join(self._parts)
+                            if "\n" in combined:
+                                line, remainder = combined.split("\n", 1)
+                                self._parts = [remainder] if remainder else []
+                                return line + "\n"
                             try:
-                                self.buffer += next(self.generator)
+                                self._parts.append(next(self.generator))
                             except StopIteration:
                                 break
-                        if "\n" in self.buffer:
-                            line, self.buffer = self.buffer.split("\n", 1)
-                            return line + "\n"
-                        result, self.buffer = self.buffer, ""
+                        result = "".join(self._parts)
+                        self._parts = []
                         return result
 
                 cur.copy_expert(copy_query, GeneratorFile(convert_line_generator()))

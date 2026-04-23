@@ -107,10 +107,25 @@ class S3Manager:
         stream = self.get_file_stream(s3_key)
         return stream.read().decode(encoding, errors='replace')
 
-    def count_file_lines(self, s3_key: str, encoding: str = 'latin1') -> int:
+    def get_file_header_line(self, s3_key: str, encoding: str = 'latin1') -> str:
+        """Lee solo la primera línea usando un range request (evita descargar el archivo completo)."""
         try:
-            content = self.get_file_content(s3_key, encoding)
-            return max(0, len(content.splitlines()) - 1)  # descontar header
+            response = self.s3_client.get_object(
+                Bucket=self.bucket_name, Key=s3_key, Range='bytes=0-8191'
+            )
+            chunk = response['Body'].read().decode(encoding, errors='replace')
+            return chunk.split('\n', 1)[0]
+        except Exception:
+            return ''
+
+    def count_file_lines(self, s3_key: str) -> int:
+        """Cuenta líneas en streaming por chunks de 1MB sin cargar el archivo en RAM."""
+        try:
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            count = 0
+            for chunk in response['Body'].iter_chunks(chunk_size=1024 * 1024):
+                count += chunk.count(b'\n')
+            return max(0, count - 1)  # descontar header
         except Exception:
             return 0
 
