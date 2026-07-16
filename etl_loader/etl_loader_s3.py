@@ -636,6 +636,8 @@ class ETLLoaderS3:
             return False
 
     def load_all_files(self, truncate_first: bool = True) -> bool:
+        wall_start = time.time()
+
         self.logger.info("\n" + "=" * 80)
         self.logger.info("INICIANDO PROCESO DE CARGA")
         self.logger.info("=" * 80 + "\n")
@@ -683,6 +685,7 @@ class ETLLoaderS3:
                     if not self._process_task_result(fn, success, rows, duration):
                         all_success = False
 
+        self.stats.wall_clock_total = time.time() - wall_start
         self.logger.info(self.stats.get_summary())
 
         if truncate_first and not self.dry_run:

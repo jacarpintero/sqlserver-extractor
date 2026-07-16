@@ -165,6 +165,7 @@ class LoadStats:
         self.failures = []
         self.total_rows = 0
         self.total_duration = 0.0
+        self.wall_clock_total = 0.0  # tiempo real medido desde fuera (incluye paralelismo)
 
     def add_success(self, table: str, file: str, rows: int, duration: float):
         self.successes.append({
@@ -188,11 +189,19 @@ class LoadStats:
             "\n" + "=" * 80,
             " RESUMEN DE CARGA",
             "=" * 80,
-            f"\nExitosas: {len(self.successes)}",
-            f"Fallidas: {len(self.failures)}",
+            f"\nExitosas:  {len(self.successes)}",
+            f"Fallidas:  {len(self.failures)}",
             f"Total filas: {format_number(self.total_rows)}",
-            f"Duracion total: {format_duration(self.total_duration)}",
         ]
+
+        if self.wall_clock_total > 0:
+            lines.append(f"Tiempo real:      {format_duration(self.wall_clock_total)}")
+            lines.append(
+                f"Tiempo por tabla: {format_duration(self.total_duration)}"
+                f"  (suma individual; tablas paralelas se solapan)"
+            )
+        else:
+            lines.append(f"Duracion total: {format_duration(self.total_duration)}")
 
         if self.successes:
             lines.append("\nTablas cargadas exitosamente:")
