@@ -488,6 +488,25 @@ class ETLLoaderS3:
                 cur.execute("ALTER TABLE public.{} ENABLE TRIGGER ALL;".format(table_name))
 
             conn.commit()
+            cur.close()
+            conn.close()
+
+            # VACUUM fuera de transaccion: reclaima el espacio en disco de las filas
+            # eliminadas por el DELETE. Sin esto, el espacio no se libera hasta que
+            # autovacuum corra (puede tardar horas), causando "No space left on device"
+            # en la siguiente carga.
+            self.logger.info("Ejecutando VACUUM para liberar espacio en disco...")
+            vacuum_conn = get_db_connection()
+            vacuum_conn.autocommit = True
+            vacuum_cur = vacuum_conn.cursor()
+            try:
+                for table_name in tables_to_truncate:
+                    self.logger.info("  VACUUM {}...".format(table_name))
+                    vacuum_cur.execute("VACUUM {};".format(table_name))
+                self.logger.info("OK VACUUM completado\n")
+            finally:
+                vacuum_cur.close()
+                vacuum_conn.close()
 
             self.logger.info("OK Todas las tablas truncadas\n")
             return True
@@ -495,13 +514,22 @@ class ETLLoaderS3:
         except Exception as e:
             self.logger.error("ERROR truncando tablas: {}".format(e))
             if "conn" in locals():
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             return False
         finally:
             if "cur" in locals():
-                cur.close()
+                try:
+                    cur.close()
+                except Exception:
+                    pass
             if "conn" in locals():
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def sync_user_laboratory_for_owners(self) -> bool:
         self.logger.info("\n" + "=" * 80)
