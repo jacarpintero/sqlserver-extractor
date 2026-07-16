@@ -136,6 +136,14 @@ class S3Manager:
         except ClientError:
             return False
 
+    def get_file_size_bytes(self, s3_key: str) -> int:
+        """Retorna el tamaño del archivo en bytes via head_object (sin descargar)."""
+        try:
+            r = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return r.get('ContentLength', 0)
+        except Exception:
+            return 0
+
     def get_bucket_info(self) -> Dict:
         try:
             self.s3_client.head_bucket(Bucket=self.bucket_name)

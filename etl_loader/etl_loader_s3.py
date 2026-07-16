@@ -10,6 +10,7 @@ Estructura S3 esperada:
 import csv
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
 from typing import List, Optional, Sequence
 
@@ -19,7 +20,6 @@ from etl_loader.config import (
     DB_CONFIG,
     TABLE_MAPPING,
     LOAD_ORDER,
-    FOREIGN_KEY_VALIDATIONS,
     OPTIMIZATION_CONFIG,
     COPY_INTEGER_DECIMAL_FIX,
 )
@@ -27,7 +27,6 @@ from etl_loader.utils import (
     setup_logging,
     get_db_connection,
     validate_file_exists,
-    count_file_lines,
     get_table_row_count,
     format_duration,
     format_number,
@@ -42,6 +41,13 @@ WEEKLY_TABLES = {
     "DDD_WEEKLY.txt",
     "PH360_WEEKLY.txt",
 }
+
+# Tablas que se cargan en paralelo (no tienen FK entre si)
+PARALLEL_TABLES = {"TS.txt", "DDD.txt", "PBS.txt", "PH360.txt"}
+PARALLEL_TABLES_WEEKLY = {"DDD_WEEKLY.txt", "PH360_WEEKLY.txt"}
+
+MAX_COPY_RETRIES = 3
+RETRY_BASE_DELAY = 10  # segundos; backoff exponencial: 10s, 20s, 40s
 
 
 def _parse_csv_header_row(first_line: str, delimiter: str) -> List[str]:
@@ -146,12 +152,6 @@ class ETLLoaderS3:
                 self.logger.error("Archivo no encontrado en S3: {}".format(file_path_or_key))
             return exists
 
-    def _count_lines(self, file_path_or_key: str) -> int:
-        if self.mode == "LOCAL":
-            return count_file_lines(file_path_or_key)
-        else:
-            return self.s3_manager.count_file_lines(file_path_or_key)
-
     def _read_header_line(self, file_path_or_key: str, encoding: str = "latin1") -> str:
         """Lee solo la primera línea del archivo de forma eficiente (range request en S3)."""
         if self.mode == "LOCAL":
@@ -165,7 +165,37 @@ class ETLLoaderS3:
         else:
             return S3FileWrapper(self.s3_manager, file_path_or_key, encoding)
 
+    def _get_file_size_mb(self, file_path_or_key: str) -> float:
+        """Tamaño del archivo en MB sin descargarlo (head_object en S3, getsize en local)."""
+        if self.mode == "LOCAL":
+            try:
+                return os.path.getsize(file_path_or_key) / (1024 * 1024)
+            except OSError:
+                return 0.0
+        return self.s3_manager.get_file_size_bytes(file_path_or_key) / (1024 * 1024)
+
     def upload_table(
+        self,
+        table_name: str,
+        file_path_or_key: str,
+        delimiter: str = ";",
+    ):
+        """Carga con reintento automatico (hasta MAX_COPY_RETRIES intentos)."""
+        for attempt in range(1, MAX_COPY_RETRIES + 1):
+            success, rows, duration = self._upload_table_once(table_name, file_path_or_key, delimiter)
+            if success:
+                return success, rows, duration
+            if attempt < MAX_COPY_RETRIES:
+                wait = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                self.logger.warning(
+                    "Intento {}/{} fallido para {}. Reintentando en {}s...".format(
+                        attempt, MAX_COPY_RETRIES, table_name, wait
+                    )
+                )
+                time.sleep(wait)
+        return False, 0, 0.0
+
+    def _upload_table_once(
         self,
         table_name: str,
         file_path_or_key: str,
@@ -182,12 +212,12 @@ class ETLLoaderS3:
             if not self._file_exists(file_path_or_key):
                 return False, 0, 0.0
 
-            file_lines = self._count_lines(file_path_or_key)
-            self.logger.info("Archivo tiene {} lineas".format(format_number(file_lines)))
+            size_mb = self._get_file_size_mb(file_path_or_key)
+            self.logger.info("Archivo: {:.1f} MB".format(size_mb))
 
             if self.dry_run:
                 self.logger.info("[DRY RUN] Saltando carga de {}".format(table_name))
-                return True, file_lines, 0.0
+                return True, 0, 0.0
 
             options = self._get_connection_options()
             conn = psycopg2.connect(**DB_CONFIG, options=options) if options else get_db_connection()
@@ -429,21 +459,35 @@ class ETLLoaderS3:
                 self.logger.warning("No hay tablas para truncar.")
                 return True
 
-            if OPTIMIZATION_CONFIG["disable_triggers"]:
-                self.logger.info("Desactivando triggers en todas las tablas...")
-                for table_name in tables_to_truncate:
-                    cur.execute("ALTER TABLE {} DISABLE TRIGGER ALL;".format(table_name))
+            self.logger.info("Truncando {} tablas (via DELETE)...".format(len(tables_to_truncate)))
 
-            self.logger.info("Truncando {} tablas...".format(len(tables_to_truncate)))
-            table_list = ["public.{}".format(t) for t in tables_to_truncate]
-            cur.execute("TRUNCATE TABLE {} RESTART IDENTITY CASCADE;".format(", ".join(table_list)))
+            # Desactivar triggers en tablas ETL para que el DELETE no falle por FK internos
+            for table_name in tables_to_truncate:
+                cur.execute("ALTER TABLE public.{} DISABLE TRIGGER ALL;".format(table_name))
+
+            # DELETE en lugar de TRUNCATE CASCADE: no se propaga a tablas externas
+            # (inventarios, user_laboratory) que tengan FK hacia las tablas ETL.
+            # TRUNCATE CASCADE usa el catalogo del esquema (no triggers) y no puede
+            # bloquearse sin incluir las tablas externas en el truncate.
+            for table_name in reversed(tables_to_truncate):
+                cur.execute("DELETE FROM public.{};".format(table_name))
+
+            # Reset de secuencias (equivalente al RESTART IDENTITY del TRUNCATE original)
+            cur.execute("""
+                SELECT seq.relname
+                FROM pg_class seq
+                JOIN pg_depend d ON d.objid = seq.oid AND d.deptype = 'a'
+                JOIN pg_class tbl ON tbl.oid = d.refobjid
+                WHERE seq.relkind = 'S' AND tbl.relname = ANY(%s)
+            """, (tables_to_truncate,))
+            for (seq_name,) in cur.fetchall():
+                cur.execute("SELECT setval(%s, 1, false);", (seq_name,))
+
+            # Reactivar triggers en tablas ETL
+            for table_name in tables_to_truncate:
+                cur.execute("ALTER TABLE public.{} ENABLE TRIGGER ALL;".format(table_name))
+
             conn.commit()
-
-            if OPTIMIZATION_CONFIG["disable_triggers"]:
-                self.logger.info("Reactivando triggers...")
-                for table_name in tables_to_truncate:
-                    cur.execute("ALTER TABLE {} ENABLE TRIGGER ALL;".format(table_name))
-                conn.commit()
 
             self.logger.info("OK Todas las tablas truncadas\n")
             return True
@@ -516,6 +560,51 @@ class ETLLoaderS3:
             if "conn" in locals():
                 conn.close()
 
+    def _load_table_task(self, file_name: str):
+        """
+        Carga una tabla individual. Retorna (file_name, success, rows, duration).
+        success=None significa que el archivo no existia (skip, no es un error).
+        """
+        if file_name not in TABLE_MAPPING:
+            self.logger.warning("{} no esta en TABLE_MAPPING, saltando...".format(file_name))
+            return file_name, None, 0, 0.0
+
+        config = TABLE_MAPPING[file_name]
+        table_name = config["table"]
+        delimiter = config["delimiter"]
+        description = config.get("description", "")
+        file_path_or_key = self._get_file_path_or_key(file_name)
+
+        self.logger.info("\n" + "-" * 80)
+        self.logger.info("Procesando: {}".format(file_name))
+        self.logger.info("Tabla: {} - {}".format(table_name, description))
+        self.logger.info("Fuente: {}".format(file_path_or_key))
+        self.logger.info("-" * 80)
+
+        if not self._file_exists(file_path_or_key):
+            self.logger.warning("Archivo no encontrado, saltando...")
+            return file_name, None, 0, 0.0
+
+        success, rows, duration = self.upload_table(table_name, file_path_or_key, delimiter)
+        return file_name, success, rows, duration
+
+    def _process_task_result(self, file_name, success, rows, duration):
+        """Aplica el resultado de _load_table_task al stats y retorna True si fue exitoso."""
+        if success is None:
+            return True  # archivo no encontrado, no es fallo
+
+        table_name = TABLE_MAPPING[file_name]["table"]
+        if success:
+            self.stats.add_success(table_name, file_name, rows, duration)
+            if file_name == "LABORATORIES.txt" and not self.dry_run:
+                self.logger.info("\nEjecutando post-procesamiento para LABORATORIES...")
+                if not self.sync_user_laboratory_for_owners():
+                    self.logger.warning("Sincronizacion de user_laboratory fallo")
+            return True
+        else:
+            self.stats.add_failure(table_name, file_name, "Error durante la carga (ver logs)")
+            return False
+
     def load_all_files(self, truncate_first: bool = True) -> bool:
         self.logger.info("\n" + "=" * 80)
         self.logger.info("INICIANDO PROCESO DE CARGA")
@@ -530,38 +619,39 @@ class ETLLoaderS3:
 
         all_success = True
 
-        for file_name in LOAD_ORDER:
-            if file_name not in TABLE_MAPPING:
-                self.logger.warning("{} no esta en TABLE_MAPPING, saltando...".format(file_name))
-                continue
+        sequential = [f for f in LOAD_ORDER if f not in PARALLEL_TABLES and f not in PARALLEL_TABLES_WEEKLY]
+        parallel_monthly = [f for f in LOAD_ORDER if f in PARALLEL_TABLES]
+        parallel_weekly = [f for f in LOAD_ORDER if f in PARALLEL_TABLES_WEEKLY]
 
-            config = TABLE_MAPPING[file_name]
-            table_name = config["table"]
-            delimiter = config["delimiter"]
-            description = config.get("description", "")
-            file_path_or_key = self._get_file_path_or_key(file_name)
-
-            self.logger.info("\n" + "-" * 80)
-            self.logger.info("Procesando: {}".format(file_name))
-            self.logger.info("Tabla: {} - {}".format(table_name, description))
-            self.logger.info("Fuente: {}".format(file_path_or_key))
-            self.logger.info("-" * 80)
-
-            if not self._file_exists(file_path_or_key):
-                self.logger.warning("Archivo no encontrado, saltando...")
-                continue
-
-            success, rows, duration = self.upload_table(table_name, file_path_or_key, delimiter)
-
-            if success:
-                self.stats.add_success(table_name, file_name, rows, duration)
-                if file_name == "LABORATORIES.txt" and not self.dry_run:
-                    self.logger.info("\nEjecutando post-procesamiento para LABORATORIES...")
-                    if not self.sync_user_laboratory_for_owners():
-                        self.logger.warning("Sincronizacion de user_laboratory fallo")
-            else:
-                self.stats.add_failure(table_name, file_name, "Error durante la carga (ver logs)")
+        # --- Fase 1: tablas padre y de referencia (orden secuencial respeta FK) ---
+        for file_name in sequential:
+            fn, success, rows, duration = self._load_table_task(file_name)
+            if not self._process_task_result(fn, success, rows, duration):
                 all_success = False
+
+        # --- Fase 2: detail reports mensuales en paralelo (sin FK entre si) ---
+        if parallel_monthly:
+            self.logger.info("\n" + "=" * 80)
+            self.logger.info("CARGANDO DETAIL REPORTS EN PARALELO ({} workers)".format(len(parallel_monthly)))
+            self.logger.info("=" * 80)
+            with ThreadPoolExecutor(max_workers=len(parallel_monthly)) as executor:
+                futures = {executor.submit(self._load_table_task, f): f for f in parallel_monthly}
+                for future in as_completed(futures):
+                    fn, success, rows, duration = future.result()
+                    if not self._process_task_result(fn, success, rows, duration):
+                        all_success = False
+
+        # --- Fase 3: weekly detail reports en paralelo ---
+        if parallel_weekly:
+            self.logger.info("\n" + "=" * 80)
+            self.logger.info("CARGANDO WEEKLY DETAIL REPORTS EN PARALELO ({} workers)".format(len(parallel_weekly)))
+            self.logger.info("=" * 80)
+            with ThreadPoolExecutor(max_workers=len(parallel_weekly)) as executor:
+                futures = {executor.submit(self._load_table_task, f): f for f in parallel_weekly}
+                for future in as_completed(futures):
+                    fn, success, rows, duration = future.result()
+                    if not self._process_task_result(fn, success, rows, duration):
+                        all_success = False
 
         self.logger.info(self.stats.get_summary())
 
