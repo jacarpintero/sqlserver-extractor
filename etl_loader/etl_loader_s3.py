@@ -491,19 +491,21 @@ class ETLLoaderS3:
             cur.close()
             conn.close()
 
-            # VACUUM fuera de transaccion: reclaima el espacio en disco de las filas
-            # eliminadas por el DELETE. Sin esto, el espacio no se libera hasta que
-            # autovacuum corra (puede tardar horas), causando "No space left on device"
-            # en la siguiente carga.
-            self.logger.info("Ejecutando VACUUM para liberar espacio en disco...")
+            # VACUUM FULL fuera de transaccion: reescribe el archivo fisico de cada
+            # tabla, devolviendo el espacio al OS. VACUUM sin FULL solo marca paginas
+            # como reutilizables dentro de PostgreSQL pero el archivo en disco no encoge,
+            # causando "No space left on device" en cargas posteriores.
+            # En tablas vacias (justo despues del DELETE) VACUUM FULL es muy rapido
+            # porque no hay datos que compactar — solo reemplaza el archivo por uno vacio.
+            self.logger.info("Ejecutando VACUUM FULL para liberar espacio en disco...")
             vacuum_conn = get_db_connection()
             vacuum_conn.autocommit = True
             vacuum_cur = vacuum_conn.cursor()
             try:
                 for table_name in tables_to_truncate:
-                    self.logger.info("  VACUUM {}...".format(table_name))
-                    vacuum_cur.execute("VACUUM {};".format(table_name))
-                self.logger.info("OK VACUUM completado\n")
+                    self.logger.info("  VACUUM FULL {}...".format(table_name))
+                    vacuum_cur.execute("VACUUM FULL {};".format(table_name))
+                self.logger.info("OK VACUUM FULL completado\n")
             finally:
                 vacuum_cur.close()
                 vacuum_conn.close()
