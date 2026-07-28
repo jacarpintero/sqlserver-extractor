@@ -22,6 +22,8 @@ from etl_loader.config import (
     LOAD_ORDER,
     OPTIMIZATION_CONFIG,
     COPY_INTEGER_DECIMAL_FIX,
+    UPSERT_TABLES,
+    DELETE_MODE_TABLES,
 )
 from etl_loader.utils import (
     setup_logging,
@@ -181,8 +183,20 @@ class ETLLoaderS3:
         delimiter: str = ";",
     ):
         """Carga con reintento automatico (hasta MAX_COPY_RETRIES intentos)."""
+        pk_column = UPSERT_TABLES.get(table_name)
+        if pk_column:
+            self.logger.info(
+                "Estrategia de carga para {}: UPSERT (tabla protegida, nunca se borra)".format(table_name)
+            )
+            load_once = lambda: self._upsert_table_once(table_name, file_path_or_key, delimiter, pk_column)
+        else:
+            self.logger.info(
+                "Estrategia de carga para {}: COPY directo (ya vaciada en truncate_all_tables)".format(table_name)
+            )
+            load_once = lambda: self._upload_table_once(table_name, file_path_or_key, delimiter)
+
         for attempt in range(1, MAX_COPY_RETRIES + 1):
-            success, rows, duration = self._upload_table_once(table_name, file_path_or_key, delimiter)
+            success, rows, duration = load_once()
             if success:
                 return success, rows, duration
             if attempt < MAX_COPY_RETRIES:
@@ -194,6 +208,137 @@ class ETLLoaderS3:
                 )
                 time.sleep(wait)
         return False, 0, 0.0
+
+    def _upsert_table_once(
+        self,
+        table_name: str,
+        file_path_or_key: str,
+        delimiter: str,
+        pk_column: str,
+    ):
+        """
+        Carga por upsert (INSERT ... ON CONFLICT DO UPDATE): nunca borra filas
+        existentes. Usado para tablas de referencia (outlets, packs, laboratories,
+        markets) de las que dependen tablas externas con datos vivos de usuario
+        (inventories, inventory_items, user_laboratory, user_market, outlet_reports).
+        Una fila que ya no venga en el extracto de SQL Server simplemente no se toca,
+        en vez de borrarse y dejar huerfano el dato del usuario.
+        """
+        start_time = time.time()
+
+        try:
+            if not self._file_exists(file_path_or_key):
+                return False, 0, 0.0
+
+            size_mb = self._get_file_size_mb(file_path_or_key)
+            self.logger.info("Archivo: {:.1f} MB".format(size_mb))
+
+            if self.dry_run:
+                self.logger.info("[DRY RUN] Saltando upsert de {}".format(table_name))
+                return True, 0, 0.0
+
+            options = self._get_connection_options()
+            conn = psycopg2.connect(**DB_CONFIG, options=options) if options else get_db_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            """, (table_name,))
+            if cur.fetchone() is None:
+                self.logger.warning(
+                    "Tabla '{}' no existe en la BD, omitiendo...".format(table_name)
+                )
+                return True, 0, 0.0
+
+            header_line = self._read_header_line(file_path_or_key)
+            if not header_line:
+                self.logger.error("Archivo vacio: {}".format(file_path_or_key))
+                return False, 0, time.time() - start_time
+            columns = _parse_csv_header_row(header_line, delimiter)
+            columns_str = ", ".join(columns)
+
+            staging_table = "staging_{}".format(table_name)
+            self.logger.info("Creando tabla temporal {}...".format(staging_table))
+            cur.execute(
+                "CREATE TEMP TABLE {} (LIKE public.{} INCLUDING DEFAULTS) ON COMMIT DROP;".format(
+                    staging_table, table_name
+                )
+            )
+
+            copy_query = """
+                COPY {table} ({columns})
+                FROM STDIN
+                WITH (
+                    FORMAT csv,
+                    DELIMITER '{delimiter}',
+                    NULL '',
+                    QUOTE '"',
+                    HEADER true,
+                    FREEZE true,
+                    ENCODING 'LATIN1'
+                );
+            """.format(table=staging_table, columns=columns_str, delimiter=delimiter)
+
+            self.logger.info("Cargando datos a tabla temporal...")
+            with self._open_file(file_path_or_key) as f:
+                cur.copy_expert(copy_query, f)
+
+            update_cols = [c for c in columns if c.lower() != pk_column.lower()]
+            set_clause = ", ".join("{c} = EXCLUDED.{c}".format(c=c) for c in update_cols)
+
+            self.logger.info("Aplicando upsert en {} (INSERT ... ON CONFLICT)...".format(table_name))
+            upsert_query = """
+                INSERT INTO public.{table} ({columns})
+                SELECT {columns} FROM {staging}
+                ON CONFLICT ({pk}) DO UPDATE SET {set_clause};
+            """.format(
+                table=table_name,
+                columns=columns_str,
+                staging=staging_table,
+                pk=pk_column,
+                set_clause=set_clause,
+            )
+            cur.execute(upsert_query)
+
+            self.logger.info("Actualizando secuencia de {}...".format(table_name))
+            cur.execute("""
+                SELECT setval(
+                    pg_get_serial_sequence('{table}', column_name),
+                    (SELECT MAX({pk}) FROM {table})
+                )
+                FROM information_schema.columns
+                WHERE table_name = '{table}'
+                AND column_default LIKE 'nextval%%'
+                AND column_name = '{pk}';
+            """.format(table=table_name, pk=pk_column))
+
+            if OPTIMIZATION_CONFIG["run_analyze"]:
+                self.logger.info("Actualizando estadisticas de {}".format(table_name))
+                cur.execute("ANALYZE {};".format(table_name))
+
+            conn.commit()
+
+            rows_loaded = get_table_row_count(table_name, self.logger)
+            duration = time.time() - start_time
+            self.logger.info(
+                "OK {} completado (upsert): {} filas en {}".format(
+                    table_name, format_number(rows_loaded), format_duration(duration)
+                )
+            )
+            return True, rows_loaded, duration
+
+        except Exception as e:
+            duration = time.time() - start_time
+            self.logger.error("ERROR cargando (upsert) {}: {}".format(table_name, e))
+            if "conn" in locals():
+                conn.rollback()
+            return False, 0, duration
+        finally:
+            if "cur" in locals():
+                cur.close()
+            if "conn" in locals():
+                conn.close()
 
     def _upload_table_once(
         self,
@@ -434,8 +579,10 @@ class ETLLoaderS3:
 
     def truncate_all_tables(self) -> bool:
         self.logger.info("\n" + "=" * 80)
-        self.logger.info("TRUNCANDO TODAS LAS TABLAS (orden inverso)")
+        self.logger.info("TRUNCANDO TODAS LAS TABLAS")
         self.logger.info("=" * 80)
+
+        phase_start = time.time()
 
         try:
             conn = get_db_connection()
@@ -443,11 +590,15 @@ class ETLLoaderS3:
 
             existing = self._get_existing_tables(cur)
 
-            # Filtrar solo las tablas que existen en la BD
+            # Filtrar solo las tablas que existen en la BD.
+            # Las tablas en UPSERT_TABLES (outlets, packs, laboratories, markets) se
+            # excluyen: se cargan por upsert y nunca se truncan (ver upload_table).
             tables_to_truncate = []
             for file_name in LOAD_ORDER:
                 if file_name in TABLE_MAPPING:
                     table_name = TABLE_MAPPING[file_name]["table"]
+                    if table_name in UPSERT_TABLES:
+                        continue
                     if table_name in existing:
                         tables_to_truncate.append(table_name)
                     else:
@@ -459,58 +610,100 @@ class ETLLoaderS3:
                 self.logger.warning("No hay tablas para truncar.")
                 return True
 
-            self.logger.info("Truncando {} tablas (via DELETE)...".format(len(tables_to_truncate)))
+            # DELETE_MODE_TABLES (products, corporations) son padres de una tabla
+            # protegida (packs, laboratories) y no se pueden truncar sin incluir esa
+            # tabla protegida en el mismo TRUNCATE. El resto no tiene ese problema y
+            # usa TRUNCATE: es una operacion de metadatos (milisegundos, sin importar
+            # si la tabla tiene 0 o 12 millones de filas) y libera el espacio en disco
+            # al SO de inmediato, sin necesitar VACUUM FULL despues.
+            truncate_group = [t for t in tables_to_truncate if t not in DELETE_MODE_TABLES]
+            delete_group = [t for t in tables_to_truncate if t in DELETE_MODE_TABLES]
 
-            # Desactivar triggers en tablas ETL para que el DELETE no falle por FK internos
-            for table_name in tables_to_truncate:
-                cur.execute("ALTER TABLE public.{} DISABLE TRIGGER ALL;".format(table_name))
+            self.logger.info(
+                "Via TRUNCATE ({} tablas): {}".format(
+                    len(truncate_group), ", ".join(truncate_group) or "ninguna"
+                )
+            )
+            self.logger.info(
+                "Via DELETE+VACUUM FULL ({} tablas, referenciadas por tablas protegidas): {}".format(
+                    len(delete_group), ", ".join(delete_group) or "ninguna"
+                )
+            )
 
-            # DELETE en lugar de TRUNCATE CASCADE: no se propaga a tablas externas
-            # (inventarios, user_laboratory) que tengan FK hacia las tablas ETL.
-            # TRUNCATE CASCADE usa el catalogo del esquema (no triggers) y no puede
-            # bloquearse sin incluir las tablas externas en el truncate.
-            for table_name in reversed(tables_to_truncate):
-                cur.execute("DELETE FROM public.{};".format(table_name))
+            if truncate_group:
+                step_start = time.time()
+                table_list = ", ".join("public.{}".format(t) for t in truncate_group)
+                cur.execute("TRUNCATE TABLE {} RESTART IDENTITY;".format(table_list))
+                conn.commit()
+                self.logger.info(
+                    "OK TRUNCATE de {} tablas en {}".format(
+                        len(truncate_group), format_duration(time.time() - step_start)
+                    )
+                )
 
-            # Reset de secuencias (equivalente al RESTART IDENTITY del TRUNCATE original)
-            cur.execute("""
-                SELECT seq.relname
-                FROM pg_class seq
-                JOIN pg_depend d ON d.objid = seq.oid AND d.deptype = 'a'
-                JOIN pg_class tbl ON tbl.oid = d.refobjid
-                WHERE seq.relkind = 'S' AND tbl.relname = ANY(%s)
-            """, (tables_to_truncate,))
-            for (seq_name,) in cur.fetchall():
-                cur.execute("SELECT setval(%s, 1, false);", (seq_name,))
+            if delete_group:
+                step_start = time.time()
 
-            # Reactivar triggers en tablas ETL
-            for table_name in tables_to_truncate:
-                cur.execute("ALTER TABLE public.{} ENABLE TRIGGER ALL;".format(table_name))
+                # Desactivar triggers para que el DELETE no falle por el FK interno
+                # hacia la tabla protegida (packs/laboratories) que no se toca.
+                for table_name in delete_group:
+                    cur.execute("ALTER TABLE public.{} DISABLE TRIGGER ALL;".format(table_name))
 
-            conn.commit()
+                for table_name in reversed(delete_group):
+                    cur.execute("DELETE FROM public.{};".format(table_name))
+
+                # Reset de secuencias (equivalente al RESTART IDENTITY del TRUNCATE)
+                cur.execute("""
+                    SELECT seq.relname
+                    FROM pg_class seq
+                    JOIN pg_depend d ON d.objid = seq.oid AND d.deptype = 'a'
+                    JOIN pg_class tbl ON tbl.oid = d.refobjid
+                    WHERE seq.relkind = 'S' AND tbl.relname = ANY(%s)
+                """, (delete_group,))
+                for (seq_name,) in cur.fetchall():
+                    cur.execute("SELECT setval(%s, 1, false);", (seq_name,))
+
+                for table_name in delete_group:
+                    cur.execute("ALTER TABLE public.{} ENABLE TRIGGER ALL;".format(table_name))
+
+                conn.commit()
+                self.logger.info(
+                    "OK DELETE de {} tablas en {}".format(
+                        len(delete_group), format_duration(time.time() - step_start)
+                    )
+                )
+
             cur.close()
             conn.close()
 
-            # VACUUM FULL fuera de transaccion: reescribe el archivo fisico de cada
-            # tabla, devolviendo el espacio al OS. VACUUM sin FULL solo marca paginas
-            # como reutilizables dentro de PostgreSQL pero el archivo en disco no encoge,
-            # causando "No space left on device" en cargas posteriores.
-            # En tablas vacias (justo despues del DELETE) VACUUM FULL es muy rapido
-            # porque no hay datos que compactar — solo reemplaza el archivo por uno vacio.
-            self.logger.info("Ejecutando VACUUM FULL para liberar espacio en disco...")
-            vacuum_conn = get_db_connection()
-            vacuum_conn.autocommit = True
-            vacuum_cur = vacuum_conn.cursor()
-            try:
-                for table_name in tables_to_truncate:
-                    self.logger.info("  VACUUM FULL {}...".format(table_name))
-                    vacuum_cur.execute("VACUUM FULL {};".format(table_name))
-                self.logger.info("OK VACUUM FULL completado\n")
-            finally:
-                vacuum_cur.close()
-                vacuum_conn.close()
+            # VACUUM FULL solo para el grupo DELETE: en una tabla ya vacia es rapido
+            # (reescribe un archivo practicamente vacio) y libera el espacio al SO,
+            # cosa que un VACUUM sin FULL no hace (solo marca paginas reutilizables
+            # dentro de PostgreSQL). El grupo TRUNCATE ya libero el espacio solo.
+            if delete_group:
+                step_start = time.time()
+                self.logger.info("Ejecutando VACUUM FULL sobre el grupo DELETE...")
+                vacuum_conn = get_db_connection()
+                vacuum_conn.autocommit = True
+                vacuum_cur = vacuum_conn.cursor()
+                try:
+                    for table_name in delete_group:
+                        self.logger.info("  VACUUM FULL {}...".format(table_name))
+                        vacuum_cur.execute("VACUUM FULL {};".format(table_name))
+                    self.logger.info(
+                        "OK VACUUM FULL completado en {}".format(
+                            format_duration(time.time() - step_start)
+                        )
+                    )
+                finally:
+                    vacuum_cur.close()
+                    vacuum_conn.close()
 
-            self.logger.info("OK Todas las tablas truncadas\n")
+            self.logger.info(
+                "OK Todas las tablas truncadas en {}\n".format(
+                    format_duration(time.time() - phase_start)
+                )
+            )
             return True
 
         except Exception as e:
@@ -594,29 +787,45 @@ class ETLLoaderS3:
         """
         Carga una tabla individual. Retorna (file_name, success, rows, duration).
         success=None significa que el archivo no existia (skip, no es un error).
+
+        Todo el cuerpo esta protegido por un try/except generico: en las fases
+        paralelas (ThreadPoolExecutor), una excepcion sin atrapar aqui (ej. un
+        error de red que boto3 no envuelve como ClientError, ver _file_exists)
+        se propagaria hasta future.result() en load_all_files() y abortaria todo
+        el pipeline, perdiendo el resultado de las tablas hermanas que ya habian
+        terminado bien en paralelo. Igual que upload_table, cualquier fallo
+        inesperado se convierte en un resultado fallido de esta tabla puntual.
         """
-        if file_name not in TABLE_MAPPING:
-            self.logger.warning("{} no esta en TABLE_MAPPING, saltando...".format(file_name))
-            return file_name, None, 0, 0.0
+        start_time = time.time()
+        try:
+            if file_name not in TABLE_MAPPING:
+                self.logger.warning("{} no esta en TABLE_MAPPING, saltando...".format(file_name))
+                return file_name, None, 0, 0.0
 
-        config = TABLE_MAPPING[file_name]
-        table_name = config["table"]
-        delimiter = config["delimiter"]
-        description = config.get("description", "")
-        file_path_or_key = self._get_file_path_or_key(file_name)
+            config = TABLE_MAPPING[file_name]
+            table_name = config["table"]
+            delimiter = config["delimiter"]
+            description = config.get("description", "")
+            file_path_or_key = self._get_file_path_or_key(file_name)
 
-        self.logger.info("\n" + "-" * 80)
-        self.logger.info("Procesando: {}".format(file_name))
-        self.logger.info("Tabla: {} - {}".format(table_name, description))
-        self.logger.info("Fuente: {}".format(file_path_or_key))
-        self.logger.info("-" * 80)
+            self.logger.info("\n" + "-" * 80)
+            self.logger.info("Procesando: {}".format(file_name))
+            self.logger.info("Tabla: {} - {}".format(table_name, description))
+            self.logger.info("Fuente: {}".format(file_path_or_key))
+            self.logger.info("-" * 80)
 
-        if not self._file_exists(file_path_or_key):
-            self.logger.warning("Archivo no encontrado, saltando...")
-            return file_name, None, 0, 0.0
+            if not self._file_exists(file_path_or_key):
+                self.logger.warning("Archivo no encontrado, saltando...")
+                return file_name, None, 0, 0.0
 
-        success, rows, duration = self.upload_table(table_name, file_path_or_key, delimiter)
-        return file_name, success, rows, duration
+            success, rows, duration = self.upload_table(table_name, file_path_or_key, delimiter)
+            return file_name, success, rows, duration
+
+        except Exception as e:
+            self.logger.error(
+                "ERROR inesperado procesando {}: {}".format(file_name, e), exc_info=True
+            )
+            return file_name, False, 0, time.time() - start_time
 
     def _process_task_result(self, file_name, success, rows, duration):
         """Aplica el resultado de _load_table_task al stats y retorna True si fue exitoso."""
@@ -625,7 +834,8 @@ class ETLLoaderS3:
 
         table_name = TABLE_MAPPING[file_name]["table"]
         if success:
-            self.stats.add_success(table_name, file_name, rows, duration)
+            mode = "UPSERT" if table_name in UPSERT_TABLES else "COPY"
+            self.stats.add_success(table_name, file_name, rows, duration, mode)
             if file_name == "LABORATORIES.txt" and not self.dry_run:
                 self.logger.info("\nEjecutando post-procesamiento para LABORATORIES...")
                 if not self.sync_user_laboratory_for_owners():

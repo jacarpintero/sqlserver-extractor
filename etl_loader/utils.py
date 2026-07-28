@@ -167,12 +167,13 @@ class LoadStats:
         self.total_duration = 0.0
         self.wall_clock_total = 0.0  # tiempo real medido desde fuera (incluye paralelismo)
 
-    def add_success(self, table: str, file: str, rows: int, duration: float):
+    def add_success(self, table: str, file: str, rows: int, duration: float, mode: str = "COPY"):
         self.successes.append({
             'table': table,
             'file': file,
             'rows': rows,
-            'duration': duration
+            'duration': duration,
+            'mode': mode,
         })
         self.total_rows += rows
         self.total_duration += duration
@@ -208,7 +209,7 @@ class LoadStats:
             for s in self.successes:
                 lines.append(
                     f"  OK {s['table']:<30} {format_number(s['rows']):>10} filas "
-                    f"en {format_duration(s['duration'])}"
+                    f"[{s.get('mode', 'COPY'):<6}] en {format_duration(s['duration'])}"
                 )
 
         if self.failures:

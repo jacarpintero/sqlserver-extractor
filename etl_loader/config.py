@@ -258,6 +258,29 @@ COPY_INTEGER_DECIMAL_FIX = {
     ],
 }
 
+# Tablas de referencia con dependientes externos vivos (inventories, inventory_items,
+# user_laboratory, user_market, outlet_reports guardan datos que el usuario captura
+# en la plataforma via FK hacia estas tablas). Nunca se truncan/borran: se cargan por
+# upsert (INSERT ... ON CONFLICT) usando la llave indicada, así una fila que deje de
+# venir en el extracto mensual de SQL Server simplemente no se toca en vez de borrarse
+# y dejar huérfano el dato del usuario.
+UPSERT_TABLES = {
+    "outlets": "code",
+    "packs": "id",
+    "laboratories": "id",
+    "markets": "id",
+}
+
+# Tablas del propio ETL que son padres de una tabla en UPSERT_TABLES
+# (packs.product_id -> products.id, laboratories.corporation_id -> corporations.id).
+# Como packs/laboratories nunca se truncan, un TRUNCATE sobre products/corporations
+# fallaria con "cannot truncate a table referenced in a foreign key constraint" a
+# menos que se incluya packs/laboratories en el mismo TRUNCATE (justo lo que no
+# queremos). Por eso estas 2 se vacian con DELETE + triggers desactivados en vez
+# de TRUNCATE — el resto de las tablas del ETL no tiene este problema y usa
+# TRUNCATE (mas rapido, libera espacio al SO sin necesitar VACUUM FULL despues).
+DELETE_MODE_TABLES = {"products", "corporations"}
+
 # Configuración de optimización
 OPTIMIZATION_CONFIG = {
     "use_freeze": True,  # Usa FREEZE en COPY para mejor performance
